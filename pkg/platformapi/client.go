@@ -5,7 +5,9 @@ package platformapi
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/openshift-online/gcp-hcp-ctl/pkg/auth"
@@ -52,16 +54,9 @@ func NewClient(apiEndpoint, project string, tokenSource *auth.TokenSource) (*Cli
 
 	apiEndpoint = strings.TrimRight(apiEndpoint, "/")
 
-	cfg := &rest.Config{
-		Host:    apiEndpoint,
-		APIPath: "/apis",
-		ContentConfig: rest.ContentConfig{
-			GroupVersion:         &gcpv1.GroupVersion,
-			NegotiatedSerializer: codecs.WithoutConversion(),
-		},
-		WrapTransport: func(rt http.RoundTripper) http.RoundTripper {
-			return &tokenTransport{base: rt, tokenSource: tokenSource}
-		},
+	cfg := clientRESTConfig(apiEndpoint)
+	cfg.WrapTransport = func(rt http.RoundTripper) http.RoundTripper {
+		return &tokenTransport{base: rt, tokenSource: tokenSource}
 	}
 
 	rc, err := rest.RESTClientFor(cfg)
@@ -72,10 +67,42 @@ func NewClient(apiEndpoint, project string, tokenSource *auth.TokenSource) (*Cli
 	return &Client{restClient: rc, project: project}, nil
 }
 
+func clientRESTConfig(endpoint string) *rest.Config {
+	return &rest.Config{
+		Host:    endpoint,
+		APIPath: "/apis",
+		ContentConfig: rest.ContentConfig{
+			GroupVersion:         &gcpv1.GroupVersion,
+			NegotiatedSerializer: codecs.WithoutConversion(),
+		},
+	}
+}
+
+// NewClientForTest builds a credential-free client for a local HTTP test server.
+// It must never be used for production requests: unlike NewClient, it does not
+// enforce HTTPS or install an authentication transport.
+func NewClientForTest(rawURL, project string) (*Client, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("test client requires a loopback HTTP endpoint")
+	}
+	ip := net.ParseIP(parsed.Hostname())
+	if parsed.Scheme != "http" || parsed.Hostname() == "" || parsed.User != nil || (parsed.Hostname() != "localhost" && (ip == nil || !ip.IsLoopback())) {
+		return nil, fmt.Errorf("test client requires a loopback HTTP endpoint")
+	}
+	rc, err := rest.RESTClientFor(clientRESTConfig(rawURL))
+	if err != nil {
+		return nil, fmt.Errorf("creating REST client: %w", err)
+	}
+	return &Client{restClient: rc, project: project}, nil
+}
+
 // tokenTransport injects an Authorization header using the auth.TokenSource.
 type tokenTransport struct {
 	base        http.RoundTripper
-	tokenSource *auth.TokenSource
+	tokenSource interface {
+		Token(context.Context) (string, string, error)
+	}
 }
 
 func (t *tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -127,44 +154,52 @@ type clusterClient struct {
 
 func (c *clusterClient) Create(ctx context.Context, namespace string, cluster *gcpv1.Cluster) (*gcpv1.Cluster, error) {
 	result := &gcpv1.Cluster{}
-	err := c.restClient.Post().
+	response := c.restClient.Post().
+		MaxRetries(0).
 		Namespace(namespace).
 		Resource("clusters").
 		Body(cluster).
-		Do(ctx).
-		Into(result)
-	return result, err
+		Do(ctx)
+	if err := decodeResult(response, result, http.MethodPost, "clusters", cluster.Name, true); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (c *clusterClient) Get(ctx context.Context, namespace, name string) (*gcpv1.Cluster, error) {
 	result := &gcpv1.Cluster{}
-	err := c.restClient.Get().
+	response := c.restClient.Get().
 		Namespace(namespace).
 		Resource("clusters").
 		Name(name).
-		Do(ctx).
-		Into(result)
-	return result, err
+		Do(ctx)
+	if err := decodeResult(response, result, http.MethodGet, "clusters", name, false); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // List returns clusters in the given namespace.
 func (c *clusterClient) List(ctx context.Context, namespace string) (*gcpv1.ClusterList, error) {
 	result := &gcpv1.ClusterList{}
-	err := c.restClient.Get().
+	response := c.restClient.Get().
 		Namespace(namespace).
 		Resource("clusters").
-		Do(ctx).
-		Into(result)
-	return result, err
+		Do(ctx)
+	if err := decodeResult(response, result, http.MethodGet, "clusters", "", false); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (c *clusterClient) Delete(ctx context.Context, namespace, name string) error {
-	return c.restClient.Delete().
+	response := c.restClient.Delete().
+		MaxRetries(0).
 		Namespace(namespace).
 		Resource("clusters").
 		Name(name).
-		Do(ctx).
-		Error()
+		Do(ctx)
+	return normalizeResult(response, http.MethodDelete, "clusters", name, false)
 }
 
 // VersionInterface defines operations on cluster-scoped Version resources.
@@ -219,55 +254,66 @@ type nodePoolClient struct {
 
 func (n *nodePoolClient) Create(ctx context.Context, namespace string, nodePool *gcpv1.NodePool) (*gcpv1.NodePool, error) {
 	result := &gcpv1.NodePool{}
-	err := n.restClient.Post().
+	response := n.restClient.Post().
+		MaxRetries(0).
 		Namespace(namespace).
 		Resource("nodepools").
 		Body(nodePool).
-		Do(ctx).
-		Into(result)
-	return result, err
+		Do(ctx)
+	if err := decodeResult(response, result, http.MethodPost, "nodepools", nodePool.Name, true); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (n *nodePoolClient) Get(ctx context.Context, namespace, name string) (*gcpv1.NodePool, error) {
 	result := &gcpv1.NodePool{}
-	err := n.restClient.Get().
+	response := n.restClient.Get().
 		Namespace(namespace).
 		Resource("nodepools").
 		Name(name).
-		Do(ctx).
-		Into(result)
-	return result, err
+		Do(ctx)
+	if err := decodeResult(response, result, http.MethodGet, "nodepools", name, false); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (n *nodePoolClient) List(ctx context.Context, namespace string) (*gcpv1.NodePoolList, error) {
 	result := &gcpv1.NodePoolList{}
-	err := n.restClient.Get().
+	response := n.restClient.Get().
 		Namespace(namespace).
 		Resource("nodepools").
-		Do(ctx).
-		Into(result)
-	return result, err
+		Do(ctx)
+	if err := decodeResult(response, result, http.MethodGet, "nodepools", "", false); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (n *nodePoolClient) Patch(ctx context.Context, namespace, name string, patchData []byte) (*gcpv1.NodePool, error) {
 	result := &gcpv1.NodePool{}
-	err := n.restClient.Patch(types.MergePatchType).
+	response := n.restClient.Patch(types.MergePatchType).
+		MaxRetries(0).
 		Namespace(namespace).
 		Resource("nodepools").
 		Name(name).
 		Body(patchData).
-		Do(ctx).
-		Into(result)
-	return result, err
+		Do(ctx)
+	if err := decodeResult(response, result, http.MethodPatch, "nodepools", name, false); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (n *nodePoolClient) Delete(ctx context.Context, namespace, name string) error {
-	return n.restClient.Delete().
+	response := n.restClient.Delete().
+		MaxRetries(0).
 		Namespace(namespace).
 		Resource("nodepools").
 		Name(name).
-		Do(ctx).
-		Error()
+		Do(ctx)
+	return normalizeResult(response, http.MethodDelete, "nodepools", name, false)
 }
 
 // NamespaceForProject returns the namespace for a given GCP project ID.

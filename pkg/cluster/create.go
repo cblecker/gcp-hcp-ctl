@@ -210,7 +210,7 @@ func (o *createOptions) run(cmd *cobra.Command, clusterName string) error {
 	ns := platformapi.NamespaceForProject(bpo.projectID)
 	created, err := client.Clusters().Create(cmd.Context(), ns, cluster)
 	if err != nil {
-		return fmt.Errorf("creating cluster: %w", err)
+		return decorateCreateError(err, o.setupInfra)
 	}
 
 	return printCluster(cmd.OutOrStdout(), created, o.outputFmt)
@@ -232,6 +232,20 @@ func validateVersion(ctx context.Context, versions platformapi.VersionInterface,
 	}
 
 	return fmt.Errorf("version %q is not available in channel group %q", version, channelGroup)
+}
+
+// decorateCreateError adds infrastructure guidance only after setup-infra has
+// completed and the subsequent create has an uncertain outcome. In particular,
+// rerunning setup-infra blindly could provision a second set of resources.
+func decorateCreateError(err error, setupInfra bool) error {
+	if err == nil {
+		return nil
+	}
+	wrapped := fmt.Errorf("creating cluster: %w", err)
+	if setupInfra && platformapi.IsUncertainOutcome(err) {
+		return fmt.Errorf("%w; inspect the cluster and provisioned IAM/network resources before retrying or cleaning up", wrapped)
+	}
+	return wrapped
 }
 
 type buildPayloadOptions struct {

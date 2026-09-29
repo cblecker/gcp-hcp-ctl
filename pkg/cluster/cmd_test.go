@@ -1,10 +1,21 @@
 package cluster
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/openshift-online/gcp-hcp-ctl/pkg/platformapi"
 	gcpv1 "github.com/openshift-online/gecko/platform-api/api/public/v1"
+	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -238,4 +249,155 @@ func TestFindCondition(t *testing.T) {
 			t.Errorf("expected nil, got %v", got)
 		}
 	})
+}
+
+const leakedResponse = `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","message":"Bearer synthetic-token","details":{"causes":[{"message":"Authorization: Bearer synthetic-token alice@example.invalid https://user:password@example.invalid/?token=synthetic-token"}]}}`
+
+func clusterTestClient(t *testing.T, code int, body string) *platformapi.Client {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(server.Close)
+	client, err := platformapi.NewClientForTest(server.URL, "my-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+func executeClusterTestCommand(t *testing.T, client *platformapi.Client, ctx context.Context, args ...string) (error, string, string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	root := &cobra.Command{Use: "gcphcpctl", SilenceUsage: true}
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetContext(ctx)
+	group := NewClusterCmd()
+	group.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
+		cmd.SetContext(context.WithValue(cmd.Context(), clientKey, client))
+		return nil
+	}
+	root.AddCommand(group)
+	root.SetArgs(append([]string{"cluster"}, args...))
+	err := root.Execute()
+	return err, stdout.String(), stderr.String()
+}
+
+func assertSafeClusterError(t *testing.T, err error, stdout, stderr, want string) {
+	t.Helper()
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+	if stdout != "" {
+		t.Errorf("unexpected stdout: %q", stdout)
+	}
+	if stderr != "Error: "+want+"\n" {
+		t.Errorf("stderr = %q, want %q", stderr, "Error: "+want+"\n")
+	}
+	for _, s := range []string{"synthetic-token", "Authorization:", "alice@example.invalid", "user:password", "Platform API", "GET clusters", "HTTP 40"} {
+		if strings.Contains(fmt.Sprintf("%+v %v %s", err, err, stderr), s) {
+			t.Errorf("leaked %q", s)
+		}
+	}
+}
+
+func TestClusterCommandErrorBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		code       int
+		body, want string
+		args       []string
+	}{
+		{"list unauthorized", 401, leakedResponse, "listing clusters: not authenticated", []string{"list"}},
+		{"list forbidden", 403, leakedResponse, "listing clusters: permission denied", []string{"list"}},
+		{"get missing", 404, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound"}`, `looking up cluster "missing" in project "my-project": not found`, []string{"get", "missing"}},
+		{"login missing", 404, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound"}`, `resolving cluster endpoint: looking up cluster "missing" in project "my-project": not found`, []string{"login", "missing"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := clusterTestClient(t, tc.code, tc.body)
+			args := append([]string(nil), tc.args...)
+			var kubeconfigPath string
+			if tc.name == "login missing" {
+				kubeconfigPath = filepath.Join(t.TempDir(), "must-not-exist")
+				args = append(args, "--kubeconfig", kubeconfigPath)
+			}
+			err, out, stderr := executeClusterTestCommand(t, client, context.Background(), args...)
+			assertSafeClusterError(t, err, out, stderr, tc.want)
+			t.Logf("stderr: %q", stderr)
+			if kubeconfigPath != "" {
+				if _, statErr := os.Stat(kubeconfigPath); !os.IsNotExist(statErr) {
+					t.Errorf("lookup failure wrote kubeconfig or stat failed: %v", statErr)
+				}
+			}
+		})
+	}
+}
+
+func TestClusterLoginInheritsExpiredParentDeadline(t *testing.T) {
+	client := clusterTestClient(t, 200, `{}`)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	start := time.Now()
+	kubeconfigPath := filepath.Join(t.TempDir(), "must-not-exist")
+	err, out, stderr := executeClusterTestCommand(t, client, ctx, "login", "missing", "--kubeconfig", kubeconfigPath)
+	assertSafeClusterError(t, err, out, stderr, `resolving cluster endpoint: looking up cluster "missing" in project "my-project": request timed out`)
+	t.Logf("stderr: %q", stderr)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("deadline sentinel lost: %v", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Error("login waited instead of honoring inherited deadline")
+	}
+	if _, statErr := os.Stat(kubeconfigPath); !os.IsNotExist(statErr) {
+		t.Errorf("timeout wrote kubeconfig or stat failed: %v", statErr)
+	}
+}
+
+func TestDecorateCreateError(t *testing.T) {
+	client := clusterTestClient(t, 500, `{}`)
+	_, uncertain := client.Clusters().Create(context.Background(), client.Namespace(), &gcpv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"}})
+	if uncertain == nil || !platformapi.IsUncertainOutcome(uncertain) {
+		t.Fatal("expected uncertain Platform API error")
+	}
+	certainClient := clusterTestClient(t, 403, leakedResponse)
+	_, certain := certainClient.Clusters().Get(context.Background(), certainClient.Namespace(), "missing")
+	for _, tc := range []struct {
+		name        string
+		err         error
+		setup, note bool
+	}{
+		{"setup uncertain", uncertain, true, true},
+		{"setup certain", certain, true, false},
+		{"config uncertain", uncertain, false, false},
+		{"success", nil, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := decorateCreateError(tc.err, tc.setup)
+			if tc.err == nil {
+				if got != nil {
+					t.Errorf("nil became %v", got)
+				}
+				return
+			}
+			if !strings.HasPrefix(got.Error(), "creating cluster: ") {
+				t.Errorf("missing context: %v", got)
+			}
+			if strings.Contains(got.Error(), "inspect the cluster and provisioned IAM/network resources") != tc.note {
+				t.Errorf("note presence = %v: %v", tc.note, got)
+			}
+			if tc.err == uncertain && strings.Count(got.Error(), "; check the resource before retrying") != 1 {
+				t.Errorf("generic advisory missing or duplicated: %v", got)
+			}
+			if platformapi.IsUncertainOutcome(got) != platformapi.IsUncertainOutcome(tc.err) {
+				t.Errorf("predicate changed: %v", got)
+			}
+			var h *platformapi.HTTPError
+			if !errors.As(got, &h) {
+				t.Errorf("HTTP error inaccessible: %v", got)
+			}
+		})
+	}
 }
