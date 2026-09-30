@@ -1,11 +1,19 @@
 package nodepool
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/openshift-online/gcp-hcp-ctl/pkg/platformapi"
 	gcpv1 "github.com/openshift-online/gecko/platform-api/api/public/v1"
+	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -424,4 +432,86 @@ func TestMachineType(t *testing.T) {
 			t.Errorf("expected '-', got %q", got)
 		}
 	})
+}
+
+func executeNodepoolError(t *testing.T, code int, body string, args ...string) (error, string, string) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+	client, err := platformapi.NewClientForTest(server.URL, "my-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	root := &cobra.Command{Use: "gcphcpctl", SilenceUsage: true}
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	group := NewNodePoolCmd()
+	group.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
+		cmd.SetContext(context.WithValue(cmd.Context(), clientKey, client))
+		return nil
+	}
+	root.AddCommand(group)
+	root.SetArgs(append([]string{"nodepool"}, args...))
+	err = root.Execute()
+	return err, stdout.String(), stderr.String()
+}
+
+func TestNodepoolCommandErrorBoundary(t *testing.T) {
+	const secrets = `Bearer synthetic-token Authorization: Bearer synthetic-token alice@example.invalid https://user:password@example.invalid/?token=synthetic-token`
+	for _, tc := range []struct {
+		name       string
+		code       int
+		body, want string
+		args       []string
+		uncertain  bool
+	}{
+		{"list unauthorized", 401, `{"error":"forbidden","message":"` + secrets + `"}`, `listing nodepools: not authenticated`, []string{"list"}, false},
+		{"get forbidden", 403, `{"error":"forbidden","message":"` + secrets + `"}`, `looking up nodepool "missing" in project "my-project": permission denied`, []string{"get", "missing"}, false},
+		{"get missing", 404, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","message":"` + secrets + `"}`, `looking up nodepool "missing" in project "my-project": not found`, []string{"get", "missing"}, false},
+		{"list forbidden", 403, `{"error":"forbidden","message":"` + secrets + `"}`, `listing nodepools: permission denied`, []string{"list"}, false},
+		{"scale forbidden", 403, `{"error":"forbidden","message":"` + secrets + `"}`, `scaling nodepool test-pool: permission denied`, []string{"scale", "test-pool", "--replicas", "3"}, false},
+		{"delete forbidden", 403, `{"error":"forbidden","message":"` + secrets + `"}`, `deleting nodepool test-pool: permission denied`, []string{"delete", "test-pool", "--confirm"}, false},
+		{"create uncertain", 503, `{"error":"` + secrets + `"}`, `creating nodepool: service unavailable; check the resource before retrying`, []string{"create", "test-pool", "--cluster", "test-cluster", "--version", "4.22.0"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err, out, stderr := executeNodepoolError(t, tc.code, tc.body, tc.args...)
+			t.Logf("stderr: %q", stderr)
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+			if out != "" || stderr != "Error: "+tc.want+"\n" {
+				t.Errorf("stdout = %q, stderr = %q", out, stderr)
+			}
+			if platformapi.IsUncertainOutcome(err) != tc.uncertain {
+				t.Errorf("uncertain = %v", platformapi.IsUncertainOutcome(err))
+			}
+			var h *platformapi.HTTPError
+			if !errors.As(err, &h) || h.StatusCode() != tc.code {
+				t.Errorf("missing HTTP metadata: %v", err)
+			}
+			for _, s := range []string{"synthetic-token", "Authorization:", "alice@example.invalid", "user:password", "Platform API", "GET nodepools", "HTTP 40"} {
+				if strings.Contains(fmt.Sprintf("%+v %v %s", err, err, stderr), s) {
+					t.Errorf("leaked %q", s)
+				}
+			}
+		})
+	}
+}
+
+func TestNodepoolCreateInvalidSuccessDoesNotLeak(t *testing.T) {
+	body := `{"kind":"NodePool","metadata":{"name":"Bearer synthetic-token"}`
+	err, out, stderr := executeNodepoolError(t, 200, body, "create", "test-pool", "--cluster", "test-cluster", "--version", "4.22.0")
+	want := "creating nodepool: server reported success, but its response was invalid; check the resource before retrying"
+	var httpErr *platformapi.HTTPError
+	if err == nil || err.Error() != want || !platformapi.IsUncertainOutcome(err) || errors.As(err, &httpErr) {
+		t.Fatalf("invalid success error = %v", err)
+	}
+	if out != "" || stderr != "Error: "+want+"\n" || strings.Contains(fmt.Sprintf("%+v %s", err, stderr), "synthetic-token") {
+		t.Fatalf("output = %q / %q", out, stderr)
+	}
 }

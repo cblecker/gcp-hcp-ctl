@@ -96,6 +96,40 @@ gcphcpctl nodepool delete my-nodepool --confirm
 
 Nodepool commands require `--api-endpoint` (or `GCPHCPCTL_API_ENDPOINT` / `api_endpoint` in config) pointing to the platform API server.
 
+### Platform API errors and troubleshooting
+
+Cluster and nodepool commands add operation or resource context to a fixed, safe
+error label. For example, command stderr can contain:
+
+```text
+Error: listing clusters: not authenticated
+Error: listing clusters: permission denied
+Error: looking up cluster "missing" in project "my-project": not found
+Error: creating nodepool: service unavailable; check the resource before retrying
+```
+
+`not authenticated` means the request did not have accepted authentication.
+`permission denied` is a generic access-denied label, **not** a diagnosis of a
+missing role, binding, or policy rule. Check the selected project and configured
+identity source; if access is expected, contact an administrator. ESPv2 may
+reject a request before it reaches the Platform API, and not every 401 response
+has a representation the CLI can interpret.
+
+Other validation, conflict, not-found, and service errors also use fixed labels.
+Normal errors omit HTTP codes, the words `Platform API`, and free-form server
+`message`, `details`, and `causes`, including any tokens, authorization headers,
+claims, or credential-bearing URLs in those fields. The typed
+`platformapi.HTTPError` retains HTTP status and request metadata for callers
+and tests. Unsupported response content types, token acquisition failures, and
+network failures may instead display `request failed`; a timeout can display
+`request timed out`. `-o json` changes successful result output, not this error
+contract. Failed commands exit non-zero.
+
+If a create fails and its outcome is uncertain, inspect the resource before
+retrying. For `cluster create --setup-infra`, inspect the cluster **and** the
+provisioned IAM/network resources before retrying or cleaning up; repeating
+setup blindly may provision another set of resources.
+
 ### IAM Infrastructure for Hosted Clusters (`iam`)
 
 Create and destroy Workload Identity Federation (WIF) infrastructure for
@@ -255,7 +289,14 @@ make clean    # Remove build artifacts
 ### Prerequisites
 
 - Go 1.25+
-- GCP credentials: `gcloud auth application-default login`
+- Google Cloud API commands (`iam`, `network`, `ops`) use Application Default
+  Credentials (ADC). For local user credentials, run
+  `gcloud auth application-default login`; supported service-account or
+  external-account credentials can also be supplied through ADC.
+- Platform API commands (`cluster`, `nodepool`) use service-account ADC or
+  external-account ADC with service-account impersonation for identity tokens.
+  With user ADC or no ADC, they instead use the active gcloud session; run
+  `gcloud auth login` if needed. ADC login alone does not establish that session.
 - Cloud Workflows deployed in the target project/region
 
 ## Architecture
