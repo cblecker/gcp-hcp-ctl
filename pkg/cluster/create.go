@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
@@ -218,7 +220,8 @@ func (o *createOptions) run(cmd *cobra.Command, clusterName string) error {
 
 func validateVersion(ctx context.Context, versions platformapi.VersionInterface, version, channelGroup string) error {
 	release, err := versions.Get(ctx, version)
-	if apierrors.IsNotFound(err) {
+	var httpErr *platformapi.HTTPError
+	if apierrors.IsNotFound(err) || (errors.As(err, &httpErr) && httpErr.StatusCode() == http.StatusNotFound) {
 		return fmt.Errorf("version %q is not supported", version)
 	}
 	if err != nil {

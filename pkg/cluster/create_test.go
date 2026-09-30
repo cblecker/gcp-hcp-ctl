@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/openshift-online/gcp-hcp-ctl/pkg/infra/iam"
 	"github.com/openshift-online/gcp-hcp-ctl/pkg/infra/network"
+	"github.com/openshift-online/gcp-hcp-ctl/pkg/platformapi"
 	gcpv1 "github.com/openshift-online/gecko/platform-api/api/public/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -81,6 +84,35 @@ func TestValidateVersion(t *testing.T) {
 			t.Fatalf("expected API error, got %v", err)
 		}
 	})
+}
+
+func TestValidateVersionLiveErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		code int
+		want string
+	}{
+		{"unauthorized", http.StatusUnauthorized, `validating version "4.21.0": not authenticated`},
+		{"forbidden", http.StatusForbidden, `validating version "4.21.0": permission denied`},
+		{"not found", http.StatusNotFound, `version "4.21.0" is not supported`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.code)
+				_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","message":"private diagnostic"}`))
+			}))
+			t.Cleanup(server.Close)
+			client, err := platformapi.NewClientForTest(server.URL, "test-project")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validateVersion(context.Background(), client.Versions(), "4.21.0", "stable"); err == nil || err.Error() != tt.want {
+				t.Fatalf("error = %v, want %q", err, tt.want)
+			}
+		})
+	}
 }
 
 func TestGenerateCompliantInfraID(t *testing.T) {

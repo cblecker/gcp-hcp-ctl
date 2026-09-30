@@ -18,6 +18,7 @@ import (
 const (
 	clusterJSON      = `{"apiVersion":"gcp.managed.openshift.io/v1","kind":"Cluster","metadata":{"name":"test-cluster"}}`
 	nodePoolJSON     = `{"apiVersion":"gcp.managed.openshift.io/v1","kind":"NodePool","metadata":{"name":"test-pool"}}`
+	versionJSON      = `{"apiVersion":"gcp.managed.openshift.io/v1","kind":"Version","metadata":{"name":"4.22.13"},"spec":{"channelGroups":["stable"]}}`
 	clusterListJSON  = `{"apiVersion":"gcp.managed.openshift.io/v1","kind":"ClusterList","items":[` + clusterJSON + `]}`
 	nodePoolListJSON = `{"apiVersion":"gcp.managed.openshift.io/v1","kind":"NodePoolList","items":[` + nodePoolJSON + `]}`
 )
@@ -84,6 +85,12 @@ func TestLiveHTTPClassification(t *testing.T) {
 			}, "GET", "nodepools", "test-pool", false},
 		{"cluster 403 Status", "application/json", `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","message":"secret"}`, "permission denied", 403,
 			func(c *Client) error { _, err := c.Clusters().List(context.Background(), "test-project"); return err }, "GET", "clusters", "", false},
+		{"version 401 Status", "application/json", `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Unauthorized","message":"private diagnostic"}`, "not authenticated", 401,
+			func(c *Client) error { _, err := c.Versions().Get(context.Background(), "4.22.13"); return err }, "GET", "versions", "4.22.13", false},
+		{"version 403 Status", "application/json", `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","message":"private diagnostic"}`, "permission denied", 403,
+			func(c *Client) error { _, err := c.Versions().Get(context.Background(), "4.22.13"); return err }, "GET", "versions", "4.22.13", false},
+		{"version 404 Status", "application/json", `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","message":"private diagnostic"}`, "not found", 404,
+			func(c *Client) error { _, err := c.Versions().Get(context.Background(), "4.22.13"); return err }, "GET", "versions", "4.22.13", false},
 		{"malformed JSON retains status", "application/json", `{"error":`, "permission denied", 403,
 			func(c *Client) error { _, err := c.NodePools().List(context.Background(), "test-project"); return err }, "GET", "nodepools", "", false},
 		{"unsupported content type loses status", "application/xml", `<error>secret</error>`, "request failed", 403,
@@ -126,6 +133,23 @@ func TestLiveHTTPClassification(t *testing.T) {
 			}
 			assertHTTPError(t, err, tt.want, tt.code, tt.method, tt.resource, tt.target, false)
 		})
+	}
+}
+
+func TestVersionGetSuccess(t *testing.T) {
+	client := testRESTClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/versions/4.22.13") {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(versionJSON))
+	})
+	version, err := client.Versions().Get(context.Background(), "4.22.13")
+	if err != nil {
+		t.Fatalf("getting version: %v", err)
+	}
+	if version.Name != "4.22.13" || len(version.Spec.ChannelGroups) != 1 || version.Spec.ChannelGroups[0] != "stable" {
+		t.Errorf("unexpected version: %#v", version)
 	}
 }
 

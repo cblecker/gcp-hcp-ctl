@@ -213,12 +213,14 @@ type versionClient struct {
 
 func (v *versionClient) Get(ctx context.Context, name string) (*gcpv1.Version, error) {
 	result := &gcpv1.Version{}
-	err := v.restClient.Get().
+	response := v.restClient.Get().
 		Resource("versions").
 		Name(name).
-		Do(ctx).
-		Into(result)
-	return result, err
+		Do(ctx)
+	if err := decodeResult(response, result, http.MethodGet, "versions", name, false); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // ResolveCluster finds a cluster by name within the client's project namespace.
